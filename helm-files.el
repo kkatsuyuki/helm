@@ -793,6 +793,8 @@ when moving out of directory when non nil."
    "Symlink files(s) `M-S, C-u to follow'" 'helm-find-files-symlink
    "Relsymlink file(s) `M-Y, C-u to follow'" 'helm-find-files-relsymlink
    "Hardlink file(s) `M-H, C-u to follow'" 'helm-find-files-hardlink
+   "Compress file(s) to archive" 'helm-find-files-compress-to
+   "Compress or uncompress file(s)" 'helm-ff-compress-marked-files
    "Change mode on file(s) `M-M'" 'helm-ff-chmod
    "Find file other window `C-c o'" 'helm-find-files-other-window
    "Find file other frame `C-c C-o'" 'find-file-other-frame
@@ -1236,7 +1238,12 @@ ACTION can be `rsync' or any action supported by `helm-dired-action'."
          (dest (or target
                    (with-helm-display-marked-candidates
                      helm-marked-buffer-name
-                     (helm-ff--count-and-collect-dups ifiles)
+                     (if (eq action 'compress)
+                         (mapcar
+                          (lambda (f)
+                            (file-relative-name f (helm-common-dir ifiles)))
+                          ifiles)
+                       (helm-ff--count-and-collect-dups ifiles))
                      (with-helm-current-buffer
                        (helm-read-file-name
                         prompt
@@ -1246,6 +1253,10 @@ ACTION can be `rsync' or any action supported by `helm-dired-action'."
                                               (if helm-ff-transformer-show-only-basename
                                                   (helm-basename cand) cand))))
                         :initial-input (helm-dwim-target-directory)
+                        :default (when (eq action 'compress)
+                                   (expand-file-name
+                                    (format "%s.tar.gz" (helm-basename cand))
+                                    helm-ff-default-directory))
                         :history (helm-find-files-history nil :comp-read nil))))))
          (dest-dir-p (file-directory-p dest))
          (dest-dir   (if dest-dir-p dest (helm-basedir dest))))
@@ -1259,10 +1270,11 @@ ACTION can be `rsync' or any action supported by `helm-dired-action'."
         ;; When saying No here with rsync, `helm-rsync-copy-files' will raise an
         ;; error about dest not existing.
         (make-directory dest-dir t)))
-    (if (eq action 'rsync)
-        (helm-rsync-copy-files ifiles dest rsync-switches)
-      (helm-dired-action
-       dest :files ifiles :action action :follow prefarg))))
+    (helm-acase action
+      (rsync (helm-rsync-copy-files ifiles dest rsync-switches))
+      (compress (helm-do-compress-to ifiles dest))
+      (t (helm-dired-action
+          dest :files ifiles :action action :follow prefarg)))))
 
 ;; Rsync
 ;;
@@ -1506,6 +1518,24 @@ This reproduce the behavior of \"cp --backup=numbered from to\"."
 (defun helm-find-files-hardlink (_candidate)
   "Hardlink files from `helm-find-files'."
   (helm-find-files-do-action 'hardlink))
+
+(defun helm-find-files-compress-to (_candidate)
+  "Compress to archive from `helm-find-files'."
+  (helm-find-files-do-action 'compress))
+
+(defun helm-ff-compress-marked-files (_candidate)
+  "Compress or uncompress marked files with `dired-compress-file'."
+  (let* ((files (helm-marked-candidates :with-wildcard t))
+         (len 0))
+    (if (not (with-helm-display-marked-candidates
+               helm-marked-buffer-name
+               (mapcar #'abbreviate-file-name files)
+               (y-or-n-p (format "Compress or uncompress *%s File(s)" (length files)))))
+        (message "(No (un)compression performed)")
+      (cl-dolist (i files)
+        (if (dired-compress-file i)
+            (cl-incf len)))
+      (message "%s File(s) (un)compressed" len))))
 
 (defun helm-ff-chmod (_candidate)
   "Set file mode on marked files.
@@ -2531,6 +2561,10 @@ Called with a prefix arg open menu unconditionally."
 (helm-make-command-from-action helm-ff-run-hardlink-file
     "Run Hardlink file action from `helm-source-find-files'."
   'helm-find-files-hardlink)
+
+(helm-make-command-from-action helm-ff-run-compress-to
+  "Run Compress to archive action from `helm-source-find-files'."
+  'helm-find-files-compress-to)
 
 (helm-make-command-from-action helm-ff-run-chmod
     "Run chmod action from `helm-source-find-files'."
@@ -5820,6 +5854,129 @@ files to destination."
         (helm-prev-visible-mark)))))
 
 
+;;; Compress/uncompress files
+;;
+;;
+(define-minor-mode helm-ff--compress-async-modeline-mode
+    "Notify mode-line that an async process run."
+  :group 'dired-async
+  :global t
+  ;; FIXME: Handle jobs like in dired-async, needs first to allow
+  ;; naming properly processes in async, they are actually all named
+  ;; emacs and running `async-batch-invoke', so if one copy a file and
+  ;; delete another file at the same time it may clash.
+  :lighter (:eval (propertize (format " [%s async job Compressing file(s)]"
+                                      (length (dired-async-processes
+                                               'helm-async-compress)))
+                              'face 'helm-delete-async-message))
+  (unless helm-ff--compress-async-modeline-mode
+    (let ((visible-bell t)) (ding))))
+
+(defun helm-do-compress-to (ifiles ofile)
+  "Compress IFILES files/directories to the OFILE archive.
+Choose the archiving command based on the OFILE extension
+and `dired-compress-files-alist'."
+  (let ((cmd (cl-loop for (r . c) in dired-compress-files-alist
+                      when (string-match r ofile) return c)))
+    (cl-assert
+     cmd nil
+     "No compression rule found for %s, see `dired-compress-files-alist'" ofile)
+    (when (and (file-exists-p ofile)
+               (not (y-or-n-p
+                     (format "%s exists, overwrite?"
+                             (abbreviate-file-name ofile)))))
+      (message "Compression aborted"))
+    ;; FIXME: provide mode-line notification like in delete files async.
+    (message "Compressing %d file(s) to `%s'..."
+             (length ifiles) (helm-basename ofile))
+    (process-put
+     (async-start
+      `(lambda ()
+         (require 'cl-lib)
+         (require 'dired-aux)
+         (let* ((default-directory
+                 (cl-loop with base = (car ',ifiles)
+                          for file in ',ifiles
+                          do (setq base (fill-common-string-prefix base file))
+                          finally return (file-name-directory base)))
+                (local-name (shell-quote-argument (file-local-name ,ofile)))
+                (input (mapconcat
+                        (lambda (in-file)
+                          (shell-quote-argument (file-relative-name in-file)))
+                        ',ifiles " "))
+                process-status)
+           (when (not (zerop
+                       (setq process-status
+                             (dired-shell-command
+                              (format-spec ,cmd `((?o . ,local-name) (?i . ,input)))))))
+             (let ((error-output (with-current-buffer " *dired-check-process output*"
+                                   (buffer-string))))
+               (with-temp-file "/tmp/dired-shell-command-output" ; Don't hard quote this.
+                 (insert error-output))))
+           process-status))
+      `(lambda (result)
+         (helm-ff--compress-async-modeline-mode -1)
+         (if (zerop result)             ; dired-shell-command succeed.
+             (progn
+               (message "Compressed %d file(s) to %s"
+                        (length ',ifiles)
+                        (file-name-nondirectory ,ofile))
+               (run-with-timer
+                0.1 nil
+                (lambda ()
+                  (dired-async-mode-line-message
+                   "%s %d file(s) to %s done"
+                   'helm-delete-async-message
+                   "Compressing"
+                   (length ',ifiles) (helm-basename ,ofile)))))
+           (when (file-exists-p "/tmp/dired-shell-command-output")
+             (pop-to-buffer (find-file-noselect "/tmp/dired-shell-command-output"))))))
+     'helm-async-compress t)
+    (helm-ff--compress-async-modeline-mode 1)))
+
+(defun helm-common-dir (files)
+  "Return the longest common directory path of FILES list"
+  (cl-loop with base = (car files)
+           for file in files
+           do (setq base (fill-common-string-prefix base file))
+           finally return (file-name-directory base)))
+
+(defun helm-ff-quick-compress (_candidate)
+  "Compress or uncompress file CANDIDATE without quitting."
+  (with-helm-window
+    (let ((cfile))
+      (unwind-protect
+          (cl-loop for c in (helm-marked-candidates) do
+                   (helm-preselect
+                    (format helm-ff-last-expanded-candidate-regexp
+                            (regexp-quote
+                             (if (and helm-ff-transformer-show-only-basename
+                                      (not (helm-ff-dot-file-p c)))
+                                 (helm-basename c) c))))
+                   (when (y-or-n-p
+                          (format "Compress or uncompress file `%s'? "
+                                  (abbreviate-file-name c)))
+                     ;; keep helm buffer
+                     (setq cfile (save-window-excursion (dired-compress-file c)))
+                     (message nil)
+                     (helm--remove-marked-and-update-mode-line c)))
+        (setq helm-marked-candidates nil
+              helm-visible-mark-overlays nil)
+        (helm-force-update
+         ;; select candidate before compress. If it can't, select candidate after compress.
+         (let ((presel (helm-get-selection)))
+           (unless (file-exists-p presel)
+             (setq presel cfile))
+           (when presel
+             (format helm-ff-last-expanded-candidate-regexp
+                     (regexp-quote (if (and helm-ff-transformer-show-only-basename
+                                            (not (helm-ff-dot-file-p presel)))
+                                       (helm-basename presel) presel))))))))))
+
+(helm-make-persistent-command-from-action helm-ff-persistent-compress
+  "Compress or uncompress marked candidates without quitting."
+  'quick-compress 'helm-ff-quick-compress)
+
 ;;; Delete and trash files
 ;;
 ;;
